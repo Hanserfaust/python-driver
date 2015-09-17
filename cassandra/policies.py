@@ -17,6 +17,7 @@ import logging
 from random import randint
 from threading import Lock
 import six
+import socket
 
 from cassandra import ConsistencyLevel
 
@@ -308,6 +309,43 @@ class DCAwareRoundRobinPolicy(LoadBalancingPolicy):
 
     def on_remove(self, host):
         self.on_down(host)
+
+class LocalhostPrioritizedDCAwareRoundRobinPolicy(DCAwareRoundRobinPolicy):
+    """
+    Similar to :class:`.DCAwareRoundRobinPolicy`, but in addition to
+    prefering prefers hosts in the local datacenter it will first and
+    foremost prefer the local machine and only uses nodes in remote
+    datacenters as a last resort.
+
+    This is useful if the client resides on the same machine as a cassandra
+    node.
+    """
+
+    local_ip = socket.gethostbyname(socket.gethostname())
+
+    def make_query_plan(self, working_keyspace=None, query=None):
+        # not thread-safe, but we don't care much about lost increments
+        # for the purposes of load balancing
+        pos = self._position
+        self._position += 1
+
+        local_live = self._dc_live_hosts.get(self.local_dc, ())
+
+        # Yield on local IP if found among the local_dc set of hosts
+        for host in local_live:
+            if host.address == self.local_ip:
+                yield host
+
+        pos = (pos % len(local_live)) if local_live else 0
+        for host in islice(cycle(local_live), pos, pos + len(local_live)):
+            yield host
+
+        # the dict can change, so get candidate DCs iterating over keys of a copy
+        other_dcs = [dc for dc in self._dc_live_hosts.copy().keys() if dc != self.local_dc]
+        for dc in other_dcs:
+            remote_live = self._dc_live_hosts.get(dc, ())
+            for host in remote_live[:self.used_hosts_per_remote_dc]:
+                yield host
 
 
 class TokenAwarePolicy(LoadBalancingPolicy):
